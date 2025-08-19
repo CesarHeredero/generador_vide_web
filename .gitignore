@@ -1,0 +1,40 @@
+# Ignorar la carpeta temporal usada por la app
+temp_files/
+# Por si acaso se creó con typo
+tep_files/
+
+# Ignorar contenido temporal dentro de temp_files si se añadiera sin slash
+temp_files/*
+
+# Archivos Python/compilados
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Bases de datos / cachés
+*.sqlite3
+*.db
+
+# Entornos virtuales
+.venv/
+env/
+venv/
+ENV/
+pip-log.txt
+
+# Logs y temporales
+*.log
+*.tmp
+tmp/
+*.swp
+
+# Editor/IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Sistema
+.DS_Store
+Thumbs.db
