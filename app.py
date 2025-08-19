@@ -12,6 +12,20 @@ import uuid
 import tempfile
 import re
 
+# --- NUEVO: intento de importar OpenCV / numpy ---
+try:
+	import cv2
+	import numpy as np
+	cv2_available = True
+	_haarcascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+	if not os.path.exists(_haarcascade_path):
+		_haarcascade_path = None
+except Exception:
+	cv2 = None
+	np = None
+	cv2_available = False
+	_haarcascade_path = None
+
 # --- nueva: detección simple de emoji ---
 _emoji_re = re.compile(
 	"[" 
@@ -30,6 +44,47 @@ def contiene_emoji(s):
 	if not s:
 		return False
 	return bool(_emoji_re.search(s))
+
+# --- NUEVO: utilidades de detección y difuminado usando OpenCV ---
+def detectar_caras_pil(img_pil):
+	"""
+	Devuelve lista de boxes (x,y,w,h) usando Haarcascade sobre imagen PIL.
+	Si OpenCV no está disponible devuelve [].
+	"""
+	if not cv2_available or _haarcascade_path is None:
+		return []
+	arr = np.array(img_pil.convert("RGB"))
+	gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+	cascade = cv2.CascadeClassifier(_haarcascade_path)
+	faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+	return faces.tolist() if len(faces) else []
+
+def es_menor_por_tamano(face_box, img_size, threshold_ratio):
+	"""
+	Heurística: si la altura de la cara < threshold_ratio * altura_imagen => considerar menor.
+	"""
+	x, y, w, h = face_box
+	_, h_img = img_size
+	return (h / float(h_img)) < float(threshold_ratio)
+
+def difuminar_caras_en_pil(img_pil, boxes, blur_radius=15, expand_factor=0.25):
+	"""
+	Aplica GaussianBlur sobre cada box (con margen expand_factor).
+	"""
+	if not boxes:
+		return img_pil
+	img = img_pil.convert("RGBA")
+	for (x, y, w, h) in boxes:
+		exp_w = int(w * expand_factor)
+		exp_h = int(h * expand_factor)
+		x0 = max(0, x - exp_w)
+		y0 = max(0, y - exp_h)
+		x1 = min(img.width, x + w + exp_w)
+		y1 = min(img.height, y + h + exp_h)
+		region = img.crop((x0, y0, x1, y1))
+		region = region.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+		img.paste(region, (x0, y0), region)
+	return img
 
 # --- nueva: carga de fuente escalable ---
 def cargar_fuente(tamano, fuente_path=None, prefer_emoji=False):
@@ -232,6 +287,21 @@ with st.sidebar:
     pos_sub_y = st.slider("Posición vertical del subtítulo (px desde arriba)", 0, 1800, 1770, 10)
     tamano_subtitulo = st.slider("Tamaño del subtítulo", 10, 1500, 200, 2)
 
+    # 4. Ajustes globales de difuminado
+    st.subheader("🔒 Privacidad / Difuminado")
+    if not cv2_available:
+        st.info("OpenCV no está disponible: la detección de caras no funcionará. Instala 'opencv-python' para habilitarla.")
+    global_blur = st.checkbox("Difuminar caras en todo el vídeo (global)", value=False)
+    global_blur_minors = st.checkbox("Si activo: difuminar solo menores (heurística por tamaño)", value=False)
+    global_blur_strength = st.slider("Intensidad difuminado (radio)", 1, 60, 15)
+    global_minors_threshold = st.slider("Umbral menores (ratio altura cara / altura imagen)", 0.02, 0.25, 0.12, step=0.01)
+
+# Guardar globals en session_state para usar al crear titulos_state
+st.session_state["global_blur"] = global_blur
+st.session_state["global_blur_minors"] = global_blur_minors
+st.session_state["global_blur_strength"] = global_blur_strength
+st.session_state["global_minors_threshold"] = global_minors_threshold
+
 # --- LÓGICA DE GENERACIÓN ---
 if "video_generado_path" not in st.session_state:
 	st.session_state["video_generado_path"] = None
@@ -325,22 +395,36 @@ if st.button("✨ ¡Generar Vídeo!"):
                     "tamano_sub": default_sub_size,
                     "color_sub": "000000",
                     "angle": 0,
-                    "angle_sub": 0
+                    "angle_sub": 0,
+                    # nuevos campos para difuminado (por imagen)
+                    "blur": st.session_state.get("global_blur", False),
+                    "blur_minors": st.session_state.get("global_blur_minors", False),
+                    "blur_strength": st.session_state.get("global_blur_strength", 15),
+                    "minors_threshold": st.session_state.get("global_minors_threshold", 0.12)
                 }
                 for i in range(len(frames_paths))
             ]
             st.success("¡Vídeo generado! Ahora puedes ajustar los títulos antes de incrustarlos.")
-# --- FUNCIÓN PARA SUPERPONER TÍTULOS EN UN FRAME (reemplazada para soportar rotación y escalado automático) ---
-def superponer_titulos_en_frame(imagen_path, titulo, subtitulo, pos_y, tamano, color, pos_sub_y, tamano_sub, color_sub, angle=0, angle_sub=0):
+# --- FUNCIÓN PARA SUPERPONER TÍTULOS EN UN FRAME ---
+# Modificar llamadas para aceptar flags blur y aplicarlo antes de dibujar texto
+def superponer_titulos_en_frame(imagen_path, titulo, subtitulo, pos_y, tamano, color, pos_sub_y, tamano_sub, color_sub, angle=0, angle_sub=0, blur=False, blur_minors=False, blur_strength=15, minors_threshold=0.12):
 	# Cargar imagen base
 	img = Image.open(imagen_path).convert("RGBA")
+	# Si se solicita difuminado, detectar caras y aplicar según opciones
+	if blur and cv2_available:
+		boxes = detectar_caras_pil(img)
+		if boxes:
+			if blur_minors:
+				# filtrar boxes por heurística de tamaño
+				boxes = [b for b in boxes if es_menor_por_tamano(b, img.size, minors_threshold)]
+			# aplicar difuminado
+			img = difuminar_caras_en_pil(img, boxes, blur_radius=blur_strength)
+	# continuar con el proceso de texto sobre la imagen (img ya puede ser RGBA)
 	w_img, h_img = img.size
-
-	# Crea capa transparente para el texto
 	canvas = Image.new("RGBA", img.size, (0,0,0,0))
 
 	# Función auxiliar para crear una capa con el texto y rotarla (ahora con auto-escalado)
-	def _draw_rotated_text(text, font_size, x_center, y_top, fill, shadow_fill, angle_deg):
+	def _draw_rotated_text_inner(base_img, text, font_size, x_center, y_top, fill, shadow_fill, angle_deg):
 		if not text:
 			return (None, None)
 		# normalizar colores
@@ -411,13 +495,13 @@ def superponer_titulos_en_frame(imagen_path, titulo, subtitulo, pos_y, tamano, c
 
 	# Título: centrado en ancho, posición vertical pos_y
 	if titulo:
-		rot_layer, pos = _draw_rotated_text(titulo, tamano, w_img//2, pos_y, color or "ffffff", "000000", angle)
+		rot_layer, pos = _draw_rotated_text_inner(img, titulo, tamano, w_img//2, pos_y, color or "ffffff", "000000", angle)
 		if rot_layer:
 			canvas.alpha_composite(rot_layer, dest=pos)
 
 	# Subtítulo
 	if subtitulo:
-		rot_layer_sub, pos_sub = _draw_rotated_text(subtitulo, tamano_sub, w_img//2, pos_sub_y, color_sub or "ffffff", "000000", angle_sub)
+		rot_layer_sub, pos_sub = _draw_rotated_text_inner(img, subtitulo, tamano_sub, w_img//2, pos_sub_y, color_sub or "ffffff", "000000", angle_sub)
 		if rot_layer_sub:
 			canvas.alpha_composite(rot_layer_sub, dest=pos_sub)
 
@@ -443,6 +527,14 @@ if st.session_state["video_generado_path"]:
 		# Edición
 		t["titulo"] = st.text_input("Título", value=t.get("titulo",""), key=f"titulo_sel_{sel}")
 		t["subtitulo"] = st.text_input("Subtítulo", value=t.get("subtitulo",""), key=f"sub_sel_{sel}")
+		# Opciones de difuminado por imagen
+		if cv2_available:
+			t["blur"] = st.checkbox("Difuminar caras en esta foto", value=t.get("blur", False), key=f"blur_sel_{sel}")
+			t["blur_minors"] = st.checkbox("  → Solo menores (heurística)", value=t.get("blur_minors", False), key=f"blurmin_sel_{sel}")
+			t["blur_strength"] = st.slider("Intensidad difuminado (radio)", 1, 60, value=int(t.get("blur_strength", 15)), key=f"blurstr_sel_{sel}")
+			t["minors_threshold"] = st.slider("Umbral menores (ratio altura cara / altura imagen)", 0.02, 0.25, value=float(t.get("minors_threshold", 0.12)), step=0.01, key=f"minorst_sel_{sel}")
+		else:
+			st.caption("Instala 'opencv-python' para habilitar difuminado de caras.")
 		t["pos_y"] = st.slider("Y título (px)", 0, 1800, value=int(t.get("pos_y",100)), step=5, key=f"posy_sel_{sel}")
 		t["tamano"] = st.slider("Tamaño título", 6, 800, value=int(t.get("tamano",90)), step=1, key=f"tamano_sel_{sel}")
 		t["angle"] = st.slider("Rotación título (grados)", -180, 180, value=int(t.get("angle",0)), step=1, key=f"angle_sel_{sel}")
@@ -473,7 +565,11 @@ if st.session_state["video_generado_path"]:
 			current["tamano_sub"],
 			current["color_sub"],
 			current.get("angle",0),
-			current.get("angle_sub",0)
+			current.get("angle_sub",0),
+			blur=current.get("blur", False),
+			blur_minors=current.get("blur_minors", False),
+			blur_strength=current.get("blur_strength", 15),
+			minors_threshold=current.get("minors_threshold", 0.12)
 		)
 		tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
 		img_preview.save(tmp.name)
@@ -500,7 +596,11 @@ if st.session_state["video_generado_path"]:
 					t["tamano_sub"],
 					t["color_sub"],
 					t.get("angle",0),
-					t.get("angle_sub",0)
+					t.get("angle_sub",0),
+					blur=t.get("blur",False),
+					blur_minors=t.get("blur_minors",False),
+					blur_strength=t.get("blur_strength",15),
+					minors_threshold=t.get("minors_threshold",0.12)
 				)
 				temp_img_path = os.path.join("temp_files", f"final_frame_{i}_{uuid.uuid4()}.png")
 				img_con_titulo.save(temp_img_path)
