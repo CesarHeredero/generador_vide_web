@@ -131,6 +131,86 @@ def cargar_fuente(tamano, fuente_path=None, prefer_emoji=False):
 	# último recurso
 	return ImageFont.load_default()
 
+# --- NUEVO: estilo por prompt y funciones de efecto (a nivel de módulo) ---
+def apply_style_effects(img_pil, prompt):
+	"""
+	Aplica efectos simples basados en palabras clave del prompt.
+	Efectos: sepia/vintage, noir/black&white, warm/cool, grain, vignette, soft/blur, glow, contrast, brighten, desaturate.
+	"""
+	if not prompt:
+		return img_pil
+	p = str(prompt).lower()
+
+	img = img_pil.convert("RGBA")
+	# brillo/contraste/color enhancers
+	from PIL import ImageEnhance, ImageOps, ImageChops, ImageFilter, Image
+	# b&w / noir
+	if any(k in p for k in ("noir", "black and white", "black&white", "b&w", "bw", "monochrome")):
+		img = ImageOps.grayscale(img).convert("RGBA")
+		# aumentar contraste
+		img = ImageEnhance.Contrast(img).enhance(1.3)
+	# sepia / vintage
+	if any(k in p for k in ("sepia", "vintage", "retro")):
+		rgb = img.convert("RGB")
+		sep = rgb.copy()
+		sep = sep.convert("L")
+		sep = sep.convert("RGB")
+		overlay = Image.new("RGB", sep.size, (230, 180, 120))
+		sep = Image.blend(sep, overlay, 0.35).convert("RGBA")
+		sep.putalpha(img.split()[-1])
+		img = sep
+	# warm / sunny
+	if any(k in p for k in ("warm", "sunny", "sun")):
+		rgb = img.convert("RGB")
+		r_enh = ImageEnhance.Color(rgb).enhance(1.1)
+		r_enh = ImageEnhance.Brightness(r_enh).enhance(1.05)
+		w, h = rgb.size
+		overlay = Image.new("RGB", (w,h), (255,140,50))
+		img = Image.blend(r_enh, overlay, 0.08).convert("RGBA")
+	# cool / blue
+	if any(k in p for k in ("cool", "blue", "cold")):
+		rgb = img.convert("RGB")
+		overlay = Image.new("RGB", rgb.size, (40,120,200))
+		img = Image.blend(rgb, overlay, 0.08).convert("RGBA")
+	# soft / blur
+	if any(k in p for k in ("soft", "blur", "gentle")):
+		img = img.filter(ImageFilter.GaussianBlur(radius=2))
+	# glow
+	if "glow" in p:
+		blur = img.filter(ImageFilter.GaussianBlur(radius=8))
+		img = ImageChops.screen(img.convert("RGB"), blur.convert("RGB")).convert("RGBA")
+	# grain
+	if any(k in p for k in ("grain", "film", "noise")):
+		w, h = img.size
+		try:
+			noise = Image.effect_noise((w, h), 64).convert("L")
+			noise = ImageEnhance.Brightness(noise).enhance(0.8)
+			noise_rgba = Image.merge("RGBA", (noise, noise, noise, noise)).convert("RGBA")
+			img = Image.blend(img, noise_rgba, 0.08)
+		except Exception:
+			pass
+	# vignette
+	if "vignette" in p:
+		w, h = img.size
+		mask = Image.new("L", (w, h), 0)
+		mdraw = ImageDraw.Draw(mask)
+		n = 8
+		for i in range(n):
+			bbox = [int(w* (-0.1 + i*(1.2/n))), int(h*(-0.1 + i*(1.2/n))), int(w*(1.1 - i*(1.2/n))), int(h*(1.1 - i*(1.2/n)))]
+			alpha = int(255 * (i/(n-1))**1.5)
+			mdraw.ellipse(bbox, fill=alpha)
+		mask = ImageOps.invert(mask)
+		black = Image.new("RGBA", (w,h), (0,0,0,180))
+		img = Image.composite(img, Image.composite(img, black, mask), mask).convert("RGBA")
+	# contrast/bright/desaturate shortcuts
+	if "contrast" in p:
+		img = ImageEnhance.Contrast(img).enhance(1.15)
+	if "bright" in p or "brillo" in p or "brighten" in p:
+		img = ImageEnhance.Brightness(img).enhance(1.08)
+	if "desaturate" in p or "desaturado" in p:
+		img = ImageEnhance.Color(img).enhance(0.5)
+	return img
+
 # --- NUEVA SECCIÓN: Ajuste de títulos tras la generación del vídeo ---
 # (Movida aquí para estar definida antes de su uso)
 def superponer_titulos_en_video(video_path, output_path, titulos, pos_y, tamano, color, pos_sub_y, tamano_sub, color_sub):
@@ -296,11 +376,18 @@ with st.sidebar:
     global_blur_strength = st.slider("Intensidad difuminado (radio)", 1, 60, 15)
     global_minors_threshold = st.slider("Umbral menores (ratio altura cara / altura imagen)", 0.02, 0.25, 0.12, step=0.01)
 
-# Guardar globals en session_state para usar al crear titulos_state
-st.session_state["global_blur"] = global_blur
-st.session_state["global_blur_minors"] = global_blur_minors
-st.session_state["global_blur_strength"] = global_blur_strength
-st.session_state["global_minors_threshold"] = global_minors_threshold
+    # --- NUEVO: controles globales de estilo (prompt) ---
+    st.subheader("🎨 Estilo del Vídeo (prompt)")
+    global_style_prompt = st.text_input("Prompt de estilo (ej: 'vintage sepia grain vignette')", value=st.session_state.get("global_style_prompt",""))
+    global_style_apply = st.checkbox("Aplicar estilo global por defecto", value=st.session_state.get("global_style_apply", False))
+
+    # guardar en session
+    st.session_state["global_blur"] = global_blur
+    st.session_state["global_blur_minors"] = global_blur_minors
+    st.session_state["global_blur_strength"] = global_blur_strength
+    st.session_state["global_minors_threshold"] = global_minors_threshold
+    st.session_state["global_style_prompt"] = global_style_prompt
+    st.session_state["global_style_apply"] = global_style_apply
 
 # --- LÓGICA DE GENERACIÓN ---
 if "video_generado_path" not in st.session_state:
@@ -336,30 +423,159 @@ if st.button("✨ ¡Generar Vídeo!"):
             if subtitulos and len(subtitulos) != len(rutas_fotos):
                 st.warning("El número de subtítulos no coincide con el de fotos. Se omitirán.")
                 subtitulos = []
+            
+            # Determinar settings a partir del prompt de estilo global (puede ajustarse por imagen luego)
+            style_prompt_global = st.session_state.get("global_style_prompt", "") or ""
+            sp = style_prompt_global.lower()
+            montage_mode = "normal"
+            if "collage" in sp or "grid" in sp:
+                montage_mode = "collage"
+            elif "overlay" in sp or "superpos" in sp:
+                montage_mode = "overlay"
+            # velocidad
+            speed_factor = 1.0
+            if "fast" in sp or "rápido" in sp:
+                speed_factor = 0.6
+            if "slow" in sp or "lento" in sp:
+                speed_factor = 1.5
+            # transición
+            use_crossfade = any(k in sp for k in ("crossfade", "fade", "dissolve"))
+            # construir frames/clips aplicando montaje
             clips_imagenes = []
             frames_paths = []
-            for i, ruta_foto in enumerate(rutas_fotos):
-                imagen_procesada_pil = ajustar_y_procesar_imagen(ruta_foto, (1080, 1920), {
-                    'texto': '',
-                    'fuente_path': None,
-                    'tamano': 1,
-                    'color': "white",
-                    'color_sombra': "black",
-                    'tamano_sub': 1,
-                    'color_sub': "white",
-                    'pos_y': 0,
-                    'pos_sub_y': 0
-                }, None)
-                ruta_temporal_frame = os.path.join(temp_dir, f"frame_{uuid.uuid4()}.png")
-                imagen_procesada_pil.save(ruta_temporal_frame)
-                frames_paths.append(ruta_temporal_frame)
-                clip = ImageClip(ruta_temporal_frame, duration=duracion_foto)
-                clips_imagenes.append(clip)
-            video_con_transiciones = [clips_imagenes[0]]
-            for i in range(len(clips_imagenes) - 1):
-                clip_actual = clips_imagenes[i+1]
-                video_con_transiciones.append(clip_actual)
-            video_final = concatenate_videoclips(video_con_transiciones, method="compose")
+            i = 0
+            N = len(rutas_fotos)
+            while i < N:
+                # seleccionar imágenes según montage_mode
+                if montage_mode == "collage":
+                    # tomar hasta 3 imágenes para collage
+                    group = rutas_fotos[i:i+3]
+                    # crear imagen procesada (usar ajustar_y_procesar_imagen en cada subimagen y luego combinar)
+                    temp_imgs = []
+                    for p in group:
+                        improc = ajustar_y_procesar_imagen(p, (1080,1920), {
+                            'texto': '',
+                            'fuente_path': None,
+                            'tamano': 1,
+                            'color': "white",
+                            'color_sombra': "black",
+                            'tamano_sub': 1,
+                            'color_sub': "white",
+                            'pos_y': 0,
+                            'pos_sub_y': 0
+                        }, None)
+                        # guardar temporal para crear collage
+                        tmpn = os.path.join(temp_dir, f"sub_{uuid.uuid4()}.png")
+                        improc.save(tmpn)
+                        temp_imgs.append(tmpn)
+                    collage_img = crear_collage(temp_imgs, tamaño=(1080,1920), modo="grid")
+                    # aplicar estilo global si activo
+                    if st.session_state.get("global_style_apply", False) and style_prompt_global:
+                        try:
+                            collage_img = apply_style_effects(collage_img, style_prompt_global)
+                        except Exception:
+                            pass
+                    ruta_temporal_frame = os.path.join(temp_dir, f"frame_{uuid.uuid4()}.png")
+                    collage_img.save(ruta_temporal_frame)
+                    frames_paths.append(ruta_temporal_frame)
+                    dur = max(0.5, duracion_foto * speed_factor)
+                    clips_imagenes.append(ImageClip(ruta_temporal_frame, duration=dur))
+                    i += len(group)
+                elif montage_mode == "overlay":
+                    # overlay current + next (or fallback single)
+                    a = rutas_fotos[i]
+                    b = rutas_fotos[i+1] if i+1 < N else None
+                    if b:
+                        # procesar y overlay
+                        a_proc = ajustar_y_procesar_imagen(a, (1080,1920), {
+                            'texto': '',
+                            'fuente_path': None,
+                            'tamano': 1,
+                            'color': "white",
+                            'color_sombra': "black",
+                            'tamano_sub': 1,
+                            'color_sub': "white",
+                            'pos_y': 0,
+                            'pos_sub_y': 0
+                        }, None)
+                        b_proc = ajustar_y_procesar_imagen(b, (1080,1920), {
+                            'texto': '',
+                            'fuente_path': None,
+                            'tamano': 1,
+                            'color': "white",
+                            'color_sombra': "black",
+                            'tamano_sub': 1,
+                            'color_sub': "white",
+                            'pos_y': 0,
+                            'pos_sub_y': 0
+                        }, None)
+                        # guardar y overlay
+                        ta = os.path.join(temp_dir, f"sub_{uuid.uuid4()}.png")
+                        tb = os.path.join(temp_dir, f"sub_{uuid.uuid4()}.png")
+                        a_proc.save(ta); b_proc.save(tb)
+                        over = overlay_two_images(ta, tb, tamaño=(1080,1920), alpha=0.35)
+                        # aplicar estilo global si procede
+                        if st.session_state.get("global_style_apply", False) and style_prompt_global:
+                            try:
+                                over = apply_style_effects(over, style_prompt_global)
+                            except Exception:
+                                pass
+                        ruta_temporal_frame = os.path.join(temp_dir, f"frame_{uuid.uuid4()}.png")
+                        over.save(ruta_temporal_frame)
+                        frames_paths.append(ruta_temporal_frame)
+                        dur = max(0.5, duracion_foto * speed_factor)
+                        clips_imagenes.append(ImageClip(ruta_temporal_frame, duration=dur))
+                        i += 2
+                    else:
+                        # último sin par
+                        single = ajustar_y_procesar_imagen(a, (1080,1920), {
+                            'texto': '',
+                            'fuente_path': None,
+                            'tamano': 1,
+                            'color': "white",
+                            'color_sombra': "black",
+                            'tamano_sub': 1,
+                            'color_sub': "white",
+                            'pos_y': 0,
+                            'pos_sub_y': 0
+                        }, None)
+                        ruta_temporal_frame = os.path.join(temp_dir, f"frame_{uuid.uuid4()}.png")
+                        single.save(ruta_temporal_frame)
+                        frames_paths.append(ruta_temporal_frame)
+                        dur = max(0.5, duracion_foto * speed_factor)
+                        clips_imagenes.append(ImageClip(ruta_temporal_frame, duration=dur))
+                        i += 1
+                else:
+                    # modo normal: cada foto -> frame
+                    p = rutas_fotos[i]
+                    imagen_procesada_pil = ajustar_y_procesar_imagen(p, (1080,1920), {
+                        'texto': '',
+                        'fuente_path': None,
+                        'tamano': 1,
+                        'color': "white",
+                        'color_sombra': "black",
+                        'tamano_sub': 1,
+                        'color_sub': "white",
+                        'pos_y': 0,
+                        'pos_sub_y': 0
+                    }, None)
+                    # aplicar estilo global si procede
+                    if st.session_state.get("global_style_apply", False) and style_prompt_global:
+                        try:
+                            imagen_procesada_pil = apply_style_effects(imagen_procesada_pil, style_prompt_global)
+                        except Exception:
+                            pass
+                    ruta_temporal_frame = os.path.join(temp_dir, f"frame_{uuid.uuid4()}.png")
+                    imagen_procesada_pil.save(ruta_temporal_frame)
+                    frames_paths.append(ruta_temporal_frame)
+                    dur = max(0.5, duracion_foto * speed_factor)
+                    clips_imagenes.append(ImageClip(ruta_temporal_frame, duration=dur))
+                    i += 1
+
+            # Concatenar con o sin crossfade (usamos padding negativo para solapar si use_crossfade)
+            padding_val = -transicion_duracion if use_crossfade else 0
+            video_final = concatenate_videoclips(clips_imagenes, method="compose", padding=padding_val)
+
             video_salida_path = os.path.join(temp_dir, "evento_final.mp4")
             if ruta_audio:
                 audio_clip = AudioFileClip(ruta_audio)
@@ -400,14 +616,17 @@ if st.button("✨ ¡Generar Vídeo!"):
                     "blur": st.session_state.get("global_blur", False),
                     "blur_minors": st.session_state.get("global_blur_minors", False),
                     "blur_strength": st.session_state.get("global_blur_strength", 15),
-                    "minors_threshold": st.session_state.get("global_minors_threshold", 0.12)
+                    "minors_threshold": st.session_state.get("global_minors_threshold", 0.12),
+                    # campos de estilo por imagen
+                    "use_style": st.session_state.get("global_style_apply", False),
+                    "style_prompt": st.session_state.get("global_style_prompt", "")
                 }
                 for i in range(len(frames_paths))
             ]
             st.success("¡Vídeo generado! Ahora puedes ajustar los títulos antes de incrustarlos.")
 # --- FUNCIÓN PARA SUPERPONER TÍTULOS EN UN FRAME ---
 # Modificar llamadas para aceptar flags blur y aplicarlo antes de dibujar texto
-def superponer_titulos_en_frame(imagen_path, titulo, subtitulo, pos_y, tamano, color, pos_sub_y, tamano_sub, color_sub, angle=0, angle_sub=0, blur=False, blur_minors=False, blur_strength=15, minors_threshold=0.12):
+def superponer_titulos_en_frame(imagen_path, titulo, subtitulo, pos_y, tamano, color, pos_sub_y, tamano_sub, color_sub, angle=0, angle_sub=0, blur=False, blur_minors=False, blur_strength=15, minors_threshold=0.12, style_apply=False, style_prompt=""):
 	# Cargar imagen base
 	img = Image.open(imagen_path).convert("RGBA")
 	# Si se solicita difuminado, detectar caras y aplicar según opciones
@@ -419,7 +638,14 @@ def superponer_titulos_en_frame(imagen_path, titulo, subtitulo, pos_y, tamano, c
 				boxes = [b for b in boxes if es_menor_por_tamano(b, img.size, minors_threshold)]
 			# aplicar difuminado
 			img = difuminar_caras_en_pil(img, boxes, blur_radius=blur_strength)
-	# continuar con el proceso de texto sobre la imagen (img ya puede ser RGBA)
+	# aplicar estilo (si está activo y hay prompt)
+	if style_apply and style_prompt:
+		try:
+			img = apply_style_effects(img, style_prompt)
+		except Exception:
+			# no bloquear si falla el efecto
+			pass
+	# continuar con el proceso (resto de la implementación igual)
 	w_img, h_img = img.size
 	canvas = Image.new("RGBA", img.size, (0,0,0,0))
 
@@ -527,6 +753,9 @@ if st.session_state["video_generado_path"]:
 		# Edición
 		t["titulo"] = st.text_input("Título", value=t.get("titulo",""), key=f"titulo_sel_{sel}")
 		t["subtitulo"] = st.text_input("Subtítulo", value=t.get("subtitulo",""), key=f"sub_sel_{sel}")
+		# Estilo por imagen (override)
+		t["use_style"] = st.checkbox("Aplicar estilo a esta foto", value=t.get("use_style", False), key=f"use_style_{sel}")
+		t["style_prompt"] = st.text_input("Prompt estilo (vacío = usar global)", value=t.get("style_prompt",""), key=f"style_prompt_{sel}")
 		# Opciones de difuminado por imagen
 		if cv2_available:
 			t["blur"] = st.checkbox("Difuminar caras en esta foto", value=t.get("blur", False), key=f"blur_sel_{sel}")
@@ -540,7 +769,7 @@ if st.session_state["video_generado_path"]:
 		t["angle"] = st.slider("Rotación título (grados)", -180, 180, value=int(t.get("angle",0)), step=1, key=f"angle_sel_{sel}")
 		t["color"] = st.color_picker("Color título", "#" + t.get("color","000000"), key=f"color_sel_{sel}")[1:]
 		# Subtitulo controls
-		t["pos_sub_y"] = st.slider("Y subtítulo (px)", 0, 1800, value=int(t.get("pos_sub_y",1700)), step=5, key=f"possuby_sel_{sel}")
+		t["pos_sub_y"] = st.slider("Y subtítulo (px)", 0, 1800, value=int(t.get("pos_sub_y",1700)), step=5, key=f'possuby_sel_{sel}')
 		t["tamano_sub"] = st.slider("Tamaño subtítulo", 6, 400, value=int(t.get("tamano_sub",60)), step=1, key=f"tamano_sub_sel_{sel}")
 		t["angle_sub"] = st.slider("Rotación subtítulo (grados)", -180, 180, value=int(t.get("angle_sub",0)), step=1, key=f"angle_sub_sel_{sel}")
 		t["color_sub"] = st.color_picker("Color subtítulo", "#" + t.get("color_sub","000000"), key=f"colorsub_sel_{sel}")[1:]
@@ -569,7 +798,9 @@ if st.session_state["video_generado_path"]:
 			blur=current.get("blur", False),
 			blur_minors=current.get("blur_minors", False),
 			blur_strength=current.get("blur_strength", 15),
-			minors_threshold=current.get("minors_threshold", 0.12)
+			minors_threshold=current.get("minors_threshold", 0.12),
+			style_apply = current.get("use_style", False),
+			style_prompt = current.get("style_prompt", "") or st.session_state.get("global_style_prompt","")
 		)
 		tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
 		img_preview.save(tmp.name)
@@ -600,7 +831,9 @@ if st.session_state["video_generado_path"]:
 					blur=t.get("blur",False),
 					blur_minors=t.get("blur_minors",False),
 					blur_strength=t.get("blur_strength",15),
-					minors_threshold=t.get("minors_threshold",0.12)
+					minors_threshold=t.get("minors_threshold",0.12),
+					style_apply = t.get("use_style", False),
+					style_prompt = t.get("style_prompt","") or st.session_state.get("global_style_prompt","")
 				)
 				temp_img_path = os.path.join("temp_files", f"final_frame_{i}_{uuid.uuid4()}.png")
 				img_con_titulo.save(temp_img_path)
