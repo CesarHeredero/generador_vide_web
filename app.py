@@ -4,8 +4,7 @@
 import streamlit as st
 import os
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-from moviepy.editor import (ImageClip, concatenate_videoclips, AudioFileClip, 
-                            CompositeVideoClip, vfx)
+from moviepy.editor import ImageClip, concatenate_videoclips, AudioFileClip, CompositeVideoClip, vfx
 import uuid # Para generar nombres de archivo únicos
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
