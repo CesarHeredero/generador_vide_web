@@ -4,7 +4,10 @@
 import streamlit as st
 import os
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-from moviepy.editor import ImageClip, concatenate_videoclips, AudioFileClip, CompositeVideoClip, vfx
+from moviepy.video.VideoClip import ImageClip
+from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
+from moviepy.audio.io.AudioFileClip import AudioFileClip
+from moviepy import concatenate_videoclips
 import uuid # Para generar nombres de archivo únicos
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
@@ -34,12 +37,17 @@ def ajustar_y_procesar_imagen(ruta_imagen, tamano_salida, titulo_info, subtitulo
 
     # Añadir Título
     if titulo_info['texto']:
-        try:
-            fuente_titulo = ImageFont.truetype(titulo_info['fuente_path'], titulo_info['tamano'])
-        except (IOError, TypeError):
-            fuente_titulo = ImageFont.load_default() # Fuente por defecto si no se encuentra
+        if titulo_info['fuente_path']:
+            try:
+                fuente_titulo = ImageFont.truetype(titulo_info['fuente_path'], titulo_info['tamano'])
+            except (IOError, TypeError):
+                fuente_titulo = ImageFont.load_default()
+        else:
+            fuente_titulo = ImageFont.load_default()
         
-        ancho_texto, alto_texto = draw.textsize(titulo_info['texto'], font=fuente_titulo)
+        bbox_titulo = draw.textbbox((0, 0), titulo_info['texto'], font=fuente_titulo)
+        ancho_texto = bbox_titulo[2] - bbox_titulo[0]
+        alto_texto = bbox_titulo[3] - bbox_titulo[1]
         pos_titulo_x = (tamano_salida[0] - ancho_texto) // 2
         pos_titulo_y = 100
         
@@ -48,12 +56,17 @@ def ajustar_y_procesar_imagen(ruta_imagen, tamano_salida, titulo_info, subtitulo
 
     # Añadir Subtítulo
     if subtitulo_texto:
-        try:
-            fuente_subtitulo = ImageFont.truetype(titulo_info['fuente_path'], titulo_info['tamano_sub'])
-        except (IOError, TypeError):
+        if titulo_info['fuente_path']:
+            try:
+                fuente_subtitulo = ImageFont.truetype(titulo_info['fuente_path'], titulo_info['tamano_sub'])
+            except (IOError, TypeError):
+                fuente_subtitulo = ImageFont.load_default()
+        else:
             fuente_subtitulo = ImageFont.load_default()
             
-        ancho_sub, alto_sub = draw.textsize(subtitulo_texto, font=fuente_subtitulo)
+        bbox_sub = draw.textbbox((0, 0), subtitulo_texto, font=fuente_subtitulo)
+        ancho_sub = bbox_sub[2] - bbox_sub[0]
+        alto_sub = bbox_sub[3] - bbox_sub[1]
         pos_sub_x = (tamano_salida[0] - ancho_sub) // 2
         pos_sub_y = tamano_salida[1] - alto_sub - 150
         
@@ -102,8 +115,6 @@ with st.sidebar:
 if st.button("✨ ¡Generar Vídeo!"):
     if not fotos_subidas:
         st.warning("Por favor, sube al menos una foto.")
-    elif not audio_subido:
-        st.warning("Por favor, sube un archivo de audio.")
     else:
         with st.spinner('Procesando... El vídeo se está creando. ¡Esto puede tardar unos minutos!'):
             # Crear directorio temporal para los archivos
@@ -119,9 +130,11 @@ if st.button("✨ ¡Generar Vídeo!"):
                     f.write(foto.getbuffer())
                 rutas_fotos.append(ruta)
 
-            ruta_audio = os.path.join(temp_dir, audio_subido.name)
-            with open(ruta_audio, "wb") as f:
-                f.write(audio_subido.getbuffer())
+            ruta_audio = None
+            if audio_subido:
+                ruta_audio = os.path.join(temp_dir, audio_subido.name)
+                with open(ruta_audio, "wb") as f:
+                    f.write(audio_subido.getbuffer())
 
             subtitulos = [s.strip() for s in subtitulos_texto.split('\n') if s.strip()]
             if subtitulos and len(subtitulos) != len(rutas_fotos):
@@ -141,28 +154,30 @@ if st.button("✨ ¡Generar Vídeo!"):
                 }
 
                 imagen_procesada_pil = ajustar_y_procesar_imagen(ruta_foto, (1080, 1920), titulo_info, subtitulo_actual)
-                
                 if i == 0:
                     primera_imagen_procesada = imagen_procesada_pil
-                
-                # Usar nombres únicos para evitar colisiones
                 ruta_temporal_frame = os.path.join(temp_dir, f"frame_{uuid.uuid4()}.png")
                 imagen_procesada_pil.save(ruta_temporal_frame)
-                clips_imagenes.append(ImageClip(ruta_temporal_frame).set_duration(duracion_foto))
+                clip = ImageClip(ruta_temporal_frame, duration=duracion_foto)
+                clips_imagenes.append(clip)
 
             # Creación del vídeo
             video_con_transiciones = [clips_imagenes[0]]
             for i in range(len(clips_imagenes) - 1):
-                clip_actual = clips_imagenes[i+1].crossfadein(transicion_duracion)
-                video_con_transiciones[-1] = video_con_transiciones[-1].set_end(video_con_transiciones[-1].end - transicion_duracion)
+                clip_actual = clips_imagenes[i+1]
+                # Elimina la línea con set_end, ya que ImageClip no tiene este método
+                # video_con_transiciones[-1] = video_con_transiciones[-1].set_end(video_con_transiciones[-1].end - transicion_duracion)
                 video_con_transiciones.append(clip_actual)
 
             video_final = concatenate_videoclips(video_con_transiciones, method="compose")
             
-            # Añadir audio
-            audio_clip = AudioFileClip(ruta_audio)
-            audio_clip = audio_clip.fx(vfx.loop, duration=video_final.duration)
-            video_final.audio = audio_clip.subclip(0, video_final.duration)
+            # Añadir audio solo si se subió
+            if ruta_audio:
+                audio_clip = AudioFileClip(ruta_audio)
+                audio_clip = audio_clip.fx(lambda c: c.loop(duration=video_final.duration))
+                video_final.audio = audio_clip.subclip(0, video_final.duration)
+            else:
+                video_final = video_final.without_audio()
 
             # Exportar
             video_salida_path = os.path.join(temp_dir, "evento_final.mp4")
