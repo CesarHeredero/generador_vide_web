@@ -272,13 +272,22 @@ def normalizar_color(c):
 	# fallback: devuelve tal cual (permite nombres como 'white')
 	return cs
 
-def ajustar_y_procesar_imagen(ruta_imagen, tamano_salida, titulo_info, subtitulo_texto=None):
+def ajustar_y_procesar_imagen(ruta_imagen, tamano_salida, titulo_info, subtitulo_texto=None, fondo_tipo="difuminado", fondo_color="#000000"):
     """
     Abre una imagen, la redimensiona para que quepa en el formato vertical,
-    crea un fondo desenfocado y añade los textos.
+    crea un fondo según el tipo seleccionado y añade los textos.
+    
+    fondo_tipo: "difuminado" o "color"
+    fondo_color: color en formato hex (#RRGGBB) para el fondo si es de tipo "color"
     """
     img = Image.open(ruta_imagen).convert("RGBA")
-    fondo = img.resize(tamano_salida, Image.LANCZOS).filter(ImageFilter.GaussianBlur(radius=30))
+    
+    # Crear el fondo según el tipo seleccionado
+    if fondo_tipo == "difuminado":
+        fondo = img.resize(tamano_salida, Image.LANCZOS).filter(ImageFilter.GaussianBlur(radius=30))
+    else:  # fondo_tipo == "color"
+        fondo = Image.new("RGBA", tamano_salida, fondo_color)
+    
     img.thumbnail(tamano_salida, Image.LANCZOS)
     
     lienzo = Image.new("RGBA", tamano_salida)
@@ -323,6 +332,55 @@ def ajustar_y_procesar_imagen(ruta_imagen, tamano_salida, titulo_info, subtitulo
         draw.text((pos_sub_x, pos_sub_y), subtitulo_texto, font=fuente_subtitulo, fill=_color_sub)
 
     return lienzo.convert("RGB")
+
+# --- NUEVO: utilidades para collage/overlay con soporte de escala por imagen ---
+import math
+def crear_collage_general(paths, scales=None, tamaño=(1080,1920)):
+    """
+    Crea un collage automático a partir de una lista de rutas.
+    - scales: lista de floats con factor de escala por imagen (1.0 = ocupa celda completa).
+    Distribución: grid cuadrada (cols = ceil(sqrt(n))).
+    """
+    if not paths:
+        return Image.new("RGB", tamaño, (0,0,0))
+    n = len(paths)
+    w, h = tamaño
+    cols = int(math.ceil(math.sqrt(n)))
+    rows = int(math.ceil(n / float(cols)))
+    cell_w = w // cols
+    cell_h = h // rows
+    canvas = Image.new("RGBA", (w, h), (0,0,0,255))
+    scales = scales or [1.0]*n
+    for idx, p in enumerate(paths):
+        try:
+            im = Image.open(p).convert("RGBA")
+        except Exception:
+            continue
+        scale = scales[idx] if idx < len(scales) else 1.0
+        target_w = max(10, int(cell_w * scale))
+        target_h = max(10, int(cell_h * scale))
+        im_resized = im.resize((target_w, target_h), Image.LANCZOS)
+        col = idx % cols
+        row = idx // cols
+        # centrar dentro de la celda
+        x0 = col * cell_w + (cell_w - target_w)//2
+        y0 = row * cell_h + (cell_h - target_h)//2
+        canvas.paste(im_resized, (x0, y0), im_resized)
+    return canvas.convert("RGB")
+
+def overlay_two_images(path_a, path_b, tamaño=(1080,1920), alpha=0.35):
+    """Superpone B encima de A con alpha (abre rutas o acepta PIL)."""
+    try:
+        a = Image.open(path_a).convert("RGBA").resize(tamaño, Image.LANCZOS)
+    except Exception:
+        a = Image.new("RGBA", tamaño, (0,0,0,255))
+    try:
+        b = Image.open(path_b).convert("RGBA").resize(tamaño, Image.LANCZOS)
+    except Exception:
+        b = Image.new("RGBA", tamaño, (0,0,0,0))
+    b.putalpha(int(255 * alpha))
+    out = Image.alpha_composite(a, b)
+    return out.convert("RGB")
 
 # --- INTERFAZ DE STREAMLIT ---
 
@@ -381,6 +439,26 @@ with st.sidebar:
     global_style_prompt = st.text_input("Prompt de estilo (ej: 'vintage sepia grain vignette')", value=st.session_state.get("global_style_prompt",""))
     global_style_apply = st.checkbox("Aplicar estilo global por defecto", value=st.session_state.get("global_style_apply", False))
 
+    # --- nuevo: controles de transición / collage ---
+    st.subheader("🔁 Montaje y Transiciones")
+    transition_type = st.selectbox("Tipo de transición", options=["none","crossfade","dissolve","slide","zoom"], index=1)
+    
+    # Nueva opción para habilitar/deshabilitar collage
+    usar_collage = st.checkbox("Usar collage para múltiples fotos", value=st.session_state.get("usar_collage", False))
+    max_photos_per_collage = st.slider("Máx. fotos por collage", 2, 6, 3, 1, 
+                                       disabled=not usar_collage)
+    
+    # Nuevo control para el tipo de fondo
+    st.subheader("🖼️ Fondo de Imagen")
+    fondo_tipo = st.selectbox("Tipo de fondo", 
+                              options=["difuminado", "color sólido"], 
+                              index=0,
+                              format_func=lambda x: "Difuminado (de la imagen)" if x == "difuminado" else "Color sólido")
+    
+    fondo_color = "#000000"
+    if fondo_tipo == "color sólido":
+        fondo_color = st.color_picker("Color de fondo", "#000000")
+
     # guardar en session
     st.session_state["global_blur"] = global_blur
     st.session_state["global_blur_minors"] = global_blur_minors
@@ -388,10 +466,56 @@ with st.sidebar:
     st.session_state["global_minors_threshold"] = global_minors_threshold
     st.session_state["global_style_prompt"] = global_style_prompt
     st.session_state["global_style_apply"] = global_style_apply
+    st.session_state["transition_type"] = transition_type
+    st.session_state["max_photos_per_collage"] = max_photos_per_collage
+    st.session_state["usar_collage"] = usar_collage
+    st.session_state["fondo_tipo"] = fondo_tipo
+    st.session_state["fondo_color"] = fondo_color
+
+# --- Mueve esta función antes de la lógica de generación (antes de la línea donde se usa) ---
+def crear_clip_zoom_pil(imagen_path, duracion, factor_zoom=0.1, fps=24):
+    """
+    Genera un clip de zoom-in usando PIL y numpy, empezando al 20% y terminando al 100%.
+    """
+    import numpy as np
+    from PIL import Image
+    from moviepy.video.VideoClip import VideoClip
+    
+    # Cargar imagen una vez fuera de make_frame
+    img = Image.open(imagen_path).convert("RGB")
+    w, h = img.size
+    
+    # Crear función make_frame que genera el frame con zoom según el tiempo
+    def make_frame(t):
+        # Calcular factor de zoom basado en el tiempo (20% -> 100%)
+        factor = 0.2 + 0.8 * (t / duracion)
+        
+        # Calcular dimensiones para el frame actual
+        current_w = int(w * factor)
+        current_h = int(h * factor)
+        
+        # Crear un lienzo negro del tamaño final
+        canvas = Image.new("RGB", (w, h), (0, 0, 0))
+        
+        # Redimensionar la imagen original al tamaño actual según el factor
+        img_resized = img.resize((current_w, current_h), Image.LANCZOS)
+        
+        # Calcular posición para centrar en el lienzo
+        paste_x = (w - current_w) // 2
+        paste_y = (h - current_h) // 2
+        
+        # Pegar la imagen redimensionada en el centro del lienzo
+        canvas.paste(img_resized, (paste_x, paste_y))
+        
+        # Convertir a array para MoviePy
+        return np.array(canvas)
+    
+    # Crear VideoClip usando la función make_frame
+    return VideoClip(make_frame, duration=duracion)
 
 # --- LÓGICA DE GENERACIÓN ---
 if "video_generado_path" not in st.session_state:
-	st.session_state["video_generado_path"] = None
+    st.session_state["video_generado_path"] = None
 if "frames_paths" not in st.session_state:
 	st.session_state["frames_paths"] = []
 if "titulos_state" not in st.session_state:
@@ -424,52 +548,76 @@ if st.button("✨ ¡Generar Vídeo!"):
                 st.warning("El número de subtítulos no coincide con el de fotos. Se omitirán.")
                 subtitulos = []
             
-            # Determinar settings a partir del prompt de estilo global (puede ajustarse por imagen luego)
+            # --- MONTAJE Y TRANSICIONES ---
             style_prompt_global = st.session_state.get("global_style_prompt", "") or ""
             sp = style_prompt_global.lower()
+            
+            # Determinar modo de montaje según la selección del usuario, no por prompt
             montage_mode = "normal"
-            if "collage" in sp or "grid" in sp:
+            if st.session_state.get("usar_collage", False):
                 montage_mode = "collage"
             elif "overlay" in sp or "superpos" in sp:
                 montage_mode = "overlay"
-            # velocidad
+                
+            # Obtenemos las opciones de fondo
+            fondo_tipo = st.session_state.get("fondo_tipo", "difuminado")
+            fondo_color = st.session_state.get("fondo_color", "#000000")
+            
             speed_factor = 1.0
             if "fast" in sp or "rápido" in sp:
                 speed_factor = 0.6
             if "slow" in sp or "lento" in sp:
                 speed_factor = 1.5
-            # transición
-            use_crossfade = any(k in sp for k in ("crossfade", "fade", "dissolve"))
-            # construir frames/clips aplicando montaje
+
+            # Transición seleccionada por el usuario
+            transition_type = st.session_state.get("transition_type", "crossfade")
+            use_crossfade = transition_type in ("crossfade", "dissolve", "fade")
+            use_slide = transition_type == "slide"
+            use_zoom = transition_type == "zoom"
+            trans_dur = transicion_duracion
+
             clips_imagenes = []
             frames_paths = []
             i = 0
             N = len(rutas_fotos)
             while i < N:
-                # seleccionar imágenes según montage_mode
                 if montage_mode == "collage":
-                    # tomar hasta 3 imágenes para collage
-                    group = rutas_fotos[i:i+3]
-                    # crear imagen procesada (usar ajustar_y_procesar_imagen en cada subimagen y luego combinar)
+                    group = rutas_fotos[i:i+st.session_state.get("max_photos_per_collage",3)]
                     temp_imgs = []
+                    scales_for_group = []
                     for p in group:
-                        improc = ajustar_y_procesar_imagen(p, (1080,1920), {
-                            'texto': '',
-                            'fuente_path': None,
-                            'tamano': 1,
-                            'color': "white",
-                            'color_sombra': "black",
-                            'tamano_sub': 1,
-                            'color_sub': "white",
-                            'pos_y': 0,
-                            'pos_sub_y': 0
-                        }, None)
-                        # guardar temporal para crear collage
+                        improc = ajustar_y_procesar_imagen(
+                            p, (1080,1920), 
+                            {
+                                'texto': '',
+                                'fuente_path': None,
+                                'tamano': 1,
+                                'color': "white",
+                                'color_sombra': "black",
+                                'tamano_sub': 1,
+                                'color_sub': "white",
+                                'pos_y': 0,
+                                'pos_sub_y': 0
+                            }, 
+                            None,
+                            fondo_tipo=fondo_tipo,
+                            fondo_color=fondo_color
+                        )
+                        if st.session_state.get("global_style_apply", False) and style_prompt_global:
+                            try:
+                                improc = apply_style_effects(improc, style_prompt_global)
+                            except Exception:
+                                pass
                         tmpn = os.path.join(temp_dir, f"sub_{uuid.uuid4()}.png")
                         improc.save(tmpn)
                         temp_imgs.append(tmpn)
-                    collage_img = crear_collage(temp_imgs, tamaño=(1080,1920), modo="grid")
-                    # aplicar estilo global si activo
+                        idx_global = i + len(temp_imgs) - 1
+                        try:
+                            s = st.session_state["titulos_state"][idx_global].get("scale",1.0)
+                        except Exception:
+                            s = 1.0
+                        scales_for_group.append(float(s))
+                    collage_img = crear_collage_general(temp_imgs, scales=scales_for_group, tamaño=(1080,1920))
                     if st.session_state.get("global_style_apply", False) and style_prompt_global:
                         try:
                             collage_img = apply_style_effects(collage_img, style_prompt_global)
@@ -479,14 +627,13 @@ if st.button("✨ ¡Generar Vídeo!"):
                     collage_img.save(ruta_temporal_frame)
                     frames_paths.append(ruta_temporal_frame)
                     dur = max(0.5, duracion_foto * speed_factor)
-                    clips_imagenes.append(ImageClip(ruta_temporal_frame, duration=dur))
+                    clip = ImageClip(ruta_temporal_frame, duration=dur)
+                    clips_imagenes.append(clip)
                     i += len(group)
                 elif montage_mode == "overlay":
-                    # overlay current + next (or fallback single)
                     a = rutas_fotos[i]
                     b = rutas_fotos[i+1] if i+1 < N else None
                     if b:
-                        # procesar y overlay
                         a_proc = ajustar_y_procesar_imagen(a, (1080,1920), {
                             'texto': '',
                             'fuente_path': None,
@@ -497,7 +644,7 @@ if st.button("✨ ¡Generar Vídeo!"):
                             'color_sub': "white",
                             'pos_y': 0,
                             'pos_sub_y': 0
-                        }, None)
+                        }, None, fondo_tipo=fondo_tipo, fondo_color=fondo_color)
                         b_proc = ajustar_y_procesar_imagen(b, (1080,1920), {
                             'texto': '',
                             'fuente_path': None,
@@ -508,13 +655,17 @@ if st.button("✨ ¡Generar Vídeo!"):
                             'color_sub': "white",
                             'pos_y': 0,
                             'pos_sub_y': 0
-                        }, None)
-                        # guardar y overlay
+                        }, None, fondo_tipo=fondo_tipo, fondo_color=fondo_color)
+                        if st.session_state.get("global_style_apply", False) and style_prompt_global:
+                            try:
+                                a_proc = apply_style_effects(a_proc, style_prompt_global)
+                                b_proc = apply_style_effects(b_proc, style_prompt_global)
+                            except Exception:
+                                pass
                         ta = os.path.join(temp_dir, f"sub_{uuid.uuid4()}.png")
                         tb = os.path.join(temp_dir, f"sub_{uuid.uuid4()}.png")
                         a_proc.save(ta); b_proc.save(tb)
                         over = overlay_two_images(ta, tb, tamaño=(1080,1920), alpha=0.35)
-                        # aplicar estilo global si procede
                         if st.session_state.get("global_style_apply", False) and style_prompt_global:
                             try:
                                 over = apply_style_effects(over, style_prompt_global)
@@ -524,10 +675,10 @@ if st.button("✨ ¡Generar Vídeo!"):
                         over.save(ruta_temporal_frame)
                         frames_paths.append(ruta_temporal_frame)
                         dur = max(0.5, duracion_foto * speed_factor)
-                        clips_imagenes.append(ImageClip(ruta_temporal_frame, duration=dur))
+                        clip = ImageClip(ruta_temporal_frame, duration=dur)
+                        clips_imagenes.append(clip)
                         i += 2
                     else:
-                        # último sin par
                         single = ajustar_y_procesar_imagen(a, (1080,1920), {
                             'texto': '',
                             'fuente_path': None,
@@ -538,15 +689,20 @@ if st.button("✨ ¡Generar Vídeo!"):
                             'color_sub': "white",
                             'pos_y': 0,
                             'pos_sub_y': 0
-                        }, None)
+                        }, None, fondo_tipo=fondo_tipo, fondo_color=fondo_color)
+                        if st.session_state.get("global_style_apply", False) and style_prompt_global:
+                            try:
+                                single = apply_style_effects(single, style_prompt_global)
+                            except Exception:
+                                pass
                         ruta_temporal_frame = os.path.join(temp_dir, f"frame_{uuid.uuid4()}.png")
                         single.save(ruta_temporal_frame)
                         frames_paths.append(ruta_temporal_frame)
                         dur = max(0.5, duracion_foto * speed_factor)
-                        clips_imagenes.append(ImageClip(ruta_temporal_frame, duration=dur))
+                        clip = ImageClip(ruta_temporal_frame, duration=dur)
+                        clips_imagenes.append(clip)
                         i += 1
                 else:
-                    # modo normal: cada foto -> frame
                     p = rutas_fotos[i]
                     imagen_procesada_pil = ajustar_y_procesar_imagen(p, (1080,1920), {
                         'texto': '',
@@ -558,7 +714,7 @@ if st.button("✨ ¡Generar Vídeo!"):
                         'color_sub': "white",
                         'pos_y': 0,
                         'pos_sub_y': 0
-                    }, None)
+                    }, None, fondo_tipo=fondo_tipo, fondo_color=fondo_color)
                     # aplicar estilo global si procede
                     if st.session_state.get("global_style_apply", False) and style_prompt_global:
                         try:
@@ -569,12 +725,33 @@ if st.button("✨ ¡Generar Vídeo!"):
                     imagen_procesada_pil.save(ruta_temporal_frame)
                     frames_paths.append(ruta_temporal_frame)
                     dur = max(0.5, duracion_foto * speed_factor)
-                    clips_imagenes.append(ImageClip(ruta_temporal_frame, duration=dur))
+                    clip = ImageClip(ruta_temporal_frame, duration=dur)
+                    clips_imagenes.append(clip)
                     i += 1
 
-            # Concatenar con o sin crossfade (usamos padding negativo para solapar si use_crossfade)
-            padding_val = -transicion_duracion if use_crossfade else 0
-            video_final = concatenate_videoclips(clips_imagenes, method="compose", padding=padding_val)
+            # --- Transiciones entre clips ---
+            final_clips = []
+            for idx, clip in enumerate(clips_imagenes):
+                if idx == 0:
+                    final_clips.append(clip)
+                else:
+                    prev = final_clips[-1]
+                    if use_crossfade:
+                        # Usa las funciones fx en lugar de los métodos
+                        final_clips[-1] = fadeout(prev, trans_dur)
+                        final_clips.append(fadein(clip, trans_dur))
+                    elif use_slide:
+                        final_clips.append(clip)
+                    elif use_zoom:
+                        # Sustituye el zoom de MoviePy por PIL
+                        zoomed = crear_clip_zoom_pil(frames_paths[idx], clip.duration, factor_zoom=0.1)
+                        final_clips.append(zoomed)
+                    else:
+                        final_clips.append(clip)
+            if use_crossfade:
+                video_final = concatenate_videoclips(final_clips, method="compose", padding=-trans_dur)
+            else:
+                video_final = concatenate_videoclips(final_clips, method="compose")
 
             video_salida_path = os.path.join(temp_dir, "evento_final.mp4")
             if ruta_audio:
@@ -619,7 +796,9 @@ if st.button("✨ ¡Generar Vídeo!"):
                     "minors_threshold": st.session_state.get("global_minors_threshold", 0.12),
                     # campos de estilo por imagen
                     "use_style": st.session_state.get("global_style_apply", False),
-                    "style_prompt": st.session_state.get("global_style_prompt", "")
+                    "style_prompt": st.session_state.get("global_style_prompt", ""),
+                    # nuevo: escala relativa para collage (0.2 - 1.5)
+                    "scale": 1.0
                 }
                 for i in range(len(frames_paths))
             ]
@@ -773,6 +952,8 @@ if st.session_state["video_generado_path"]:
 		t["tamano_sub"] = st.slider("Tamaño subtítulo", 6, 400, value=int(t.get("tamano_sub",60)), step=1, key=f"tamano_sub_sel_{sel}")
 		t["angle_sub"] = st.slider("Rotación subtítulo (grados)", -180, 180, value=int(t.get("angle_sub",0)), step=1, key=f"angle_sub_sel_{sel}")
 		t["color_sub"] = st.color_picker("Color subtítulo", "#" + t.get("color_sub","000000"), key=f"colorsub_sel_{sel}")[1:]
+		# Escala para collage / superposición (afecta cómo se dimensiona en collage)
+		t["scale"] = st.slider("Escala foto (para collage)", 0.3, 1.5, value=float(t.get("scale",1.0)), step=0.05, key=f"scale_sel_{sel}")
 		# Guardar cambios (actualiza session_state)
 		if st.button("Guardar cambios", key=f"guardar_{sel}"):
 			st.session_state["titulos_state"][sel] = t
