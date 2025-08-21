@@ -2,6 +2,7 @@
 temp_files/
 # Por si acaso se creó con typo
 tep_files/
+.devcontainer/
 
 # Ignorar contenido temporal dentro de temp_files si se añadiera sin slash
 temp_files/*
