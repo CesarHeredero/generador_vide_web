@@ -38,3 +38,6 @@ tmp/
 # Sistema
 .DS_Store
 Thumbs.db
+
+#Mis recursos
+iniciar-programa.txt
